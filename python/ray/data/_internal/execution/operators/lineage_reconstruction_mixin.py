@@ -1,4 +1,5 @@
 import abc
+import itertools
 import logging
 from dataclasses import replace
 from typing import Any, Dict, FrozenSet, Iterable, Iterator, List, Optional, Set, Tuple
@@ -16,6 +17,8 @@ from ray.data._internal.execution.lineage_tracker import (
 from ray.data._internal.execution.operators.base_physical_operator import (
     InternalQueueOperatorMixin,
 )
+from ray.data.block import Block
+from ray.types import ObjectRef
 
 logger = logging.getLogger(__name__)
 
@@ -368,7 +371,9 @@ class LineageReconstructionMixin(InternalQueueOperatorMixin, abc.ABC):
             # rows, so these blocks are dropped.
             consumer = self._consumer_of(child_task_id)
             if consumer.join_queued_reconstruction_task(child_task_id, ready_plan_ids):
+                self._drop_withheld_outputs(blocks_per_plan)
                 continue
+            self._drop_withheld_outputs(blocks_per_plan[1:], kept=blocks_per_plan[0])
             # Create a complete RefBundle containing all reconstruction blocks withheld for a child reconstruction task,
             # stamp it with the child reconstruction task's lineage task ID and every plan it serves.
             inputs = replace(
@@ -381,6 +386,34 @@ class LineageReconstructionMixin(InternalQueueOperatorMixin, abc.ABC):
             consumer._queue_reconstruction_task(child_task_id)
             # Add to the output queue of the current task
             self._enqueue_reconstruction_output(inputs, task_index)
+
+    def _drop_withheld_outputs(
+        self,
+        blocks_per_plan: List[List[RefBundle]],
+        kept: Optional[List[RefBundle]] = None,
+    ) -> None:
+        """Report popped withheld outputs that no consumer will read: not in
+        ``kept`` (the bundle being released) and not still withheld by another
+        plan."""
+        live = {
+            ref.hex()  # pyrefly: ignore[missing-attribute]
+            for bundle in itertools.chain(
+                kept or [], self._iter_reconstruction_outputs()
+            )
+            for ref in bundle.block_refs
+        }
+        dropped: Dict[str, ObjectRef[Block]] = {}
+        for bundles in blocks_per_plan:
+            for bundle in bundles:
+                for ref in bundle.block_refs:
+                    key = ref.hex()  # pyrefly: ignore[missing-attribute]
+                    if key not in live:
+                        dropped[key] = ref
+        if dropped:
+            self._on_withheld_outputs_dropped(list(dropped.values()))
+
+    def _on_withheld_outputs_dropped(self, refs: List[ObjectRef[Block]]) -> None:
+        """Hook: withheld output ``refs`` were dropped without being released."""
 
     def _iter_reconstruction_outputs(self) -> Iterator[RefBundle]:
         """The re-produced outputs withheld for child reconstruction tasks not yet ready."""
